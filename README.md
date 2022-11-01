@@ -1,0 +1,2 @@
+# rust-course
+learn rust
