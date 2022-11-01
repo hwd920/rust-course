@@ -1,0 +1,222 @@
+对于有经验的 Rust 程序员或者经常查看 Rust 源码的程序员来说，对于 `PhantomData` 这个结构可能不会陌生，而对于初次接触到这个结构的人来说，可能就一时难以理解了，不太能明白它存在的意义了。从它的名字来看“幻影数据”，似乎它是在表达一种实际并不存在但又像影子一样你又确实能感受到它的存在的一种数据类型？
+
+它在标准库中的定义如下：
+
+```rust
+#[lang = "phantom_data"]
+#[stable(feature = "rust1", since = "1.0.0")]
+pub struct PhantomData<T: ?Sized>;
+```
+
+可以到它只是一个不占用任何空间的单元结构体，`#[lang = "phantom_data"]` 也表明了它是一个语言项，供 Rust 编译器本身使用。
+
+# 未使用的泛型参数
+
+当在你自定义的结构体里面添加一个 `PhantomData` 字段的时候其实就是***指示编译器可以认为你的结构体拥有类型为\*** ***`T`\*** ***的值，但实际上你的结构体并没有使用到这个值\***。特别是在处理不安全代码的时候，我们经常会遇到这种情况：类型或生命周期参数在逻辑上与你自定义的结构体相关联，但它实际上并不是你结构体字段的一部分，如下：
+
+```rust
+struct Slice<'a, T> {
+    start: *const T,
+    end: *const T,
+}
+```
+
+上面那段代码想要表达的意图就是结构体 `Slice` 里面的字段只在生命周期 `'a` 内有效，因此 `Slice` 实例的生命周期不应该长于生命周期 `'a`；但是这个意图并没有在上面的代码中表达出来，因为生命周期 `'a` 并没有在这个结构体中用到（这种情况称它是**无界**的，无界的生命周期或类型参数禁止在结构体定义中使用）。
+
+正确的做法就是在结构体中定义一个 `PhantomData` 来标记对生命周期 `'a` 的使用，用于让 `Slice` 结构体“看起来”包含了一个对 `&'a T` 的引用。
+
+```rust
+struct Slice<'a, T: 'a> {
+    start: *const T,
+    end: *const T,
+    phantom: PhantomData<&'a T>,
+}
+```
+
+对此之外，`PhantomData` 还可用于对未使用的参数类型身上，比如下面的代码中就存在一个无界的类型参数，是编译不过的：
+
+```rust
+struct UnUsedSomeType<T, E> {
+    value: T,
+}
+```
+
+这种未使用的参数类型的情况可能在与其他语言交互的时候可能会遇到，正确做法同样是需要使用 `PhantomData` 标记一下。
+
+```rust
+struct UnUsedSomeType<T, E> {
+    value: T,
+    _mark: PhantomData<E>,
+}
+```
+
+# 标记所有权和用于 drop 检查
+
+比如在 Rust 标准库中用的比较多的一个结构体 `Unique` 的定义如下：
+
+```rust
+pub struct Unique<T: ?Sized> {
+    pointer: *const T,
+    _marker: PhantomData<T>,
+}
+```
+
+可能有些人看到这里就不是很能理解了，因为这里并没有未使用到的参数的情况，并且直接去掉 `_marker` 字段也是可以编译通过的。一切看起来都是那么完美，除了那个 `_marker` 字段看起来有点多余的样子。
+
+这显然不可能是多余的，假设这里去掉 `PhantomData` 字段标记的话，`Unique` 在析构的时候就不会析构掉类型 `T` 的值，所以需要使用 `PhantomData` 加一个标记来让编译器理解 `Unique` 结构体在逻辑上拥有类型 `T` 的值，这样才可以让 **drop check** 正常工作，因为 **drop check** 的规则中有一条是“只当一个类型中拥有类型 D 的数据的时候才会做检查”。
+
+而对于上面的情况，若没有 `PhantomData` 字段做标记，Rust 并不会认为 `Unique` 拥有类型 `T` 的值，具体可以[点这里](https://github.com/rust-lang/rfcs/blob/master/text/0769-sound-generic-drop.md#when-does-one-type-own-another)。
+
+# 型变
+
+除了上面作用外，`PhantomData` 还有一个很重要的作用就是**型变**。要理解型变，我们需要先了解一下**子类型**的概念。**子类型**是相对于另外一种具有替代关系的**超类型**而言的，一般来说，需要**超类型**的地方都可以用**子类型**来替代。子类型关系一般写作 `A <: B`，表示 `A` 是 `B` 的**子类型**，`B` 是 `A` 的**超类型**。
+
+在原始类型的基础上构造更复杂的类型时，如何根据原始类型的子类型关系确定复杂类型的子类型关系的规则就是**型变**。
+
+比如，假设 `Student` 是 `People` 的子类型，那么 `Vec` 是否也是 `Vec` 的子类型呢？也就是说在任何需要 `Vec` 的地方是否可以直接使用 `Vec` 类型。
+
+**型变**一般分为三种形式：
+
+- **协变**：复杂类型保持原始子类型间的关系；A 是 B 的子类型，那么 Vec 也是 Vec **的子类型。**
+- ***\*逆变\**：复杂类型逆转原始子类型间的关系；A 是 B 的子类型，那么 Vec** **是 Vec \**的父类型。\****
+- ***\**\*不变\*\*：复杂类型间的关系和原始子类型没有关系；A 是 B 的子类型，Vec\** \**和 Vec \*\*也没任何关系。\*\**\***
+
+***\**\*需要注意的是，Rust 语言中只有生命周期具有子类型关系。并且长生命周期是短生命周期的子类型，记作 `'long: 'short`。这其实是很容易理解的，\*\*因为在任何需要短生命周期的地方放一个长生命周期进去都是合法的，而反过来则会发生未定义错误等问题\*\*。\*\**\***
+
+***\**\*[![18064-4a6tmoyfk3u.png](https://www.coder.rs/usr/uploads/2021/05/3758607470.png)](https://www.coder.rs/usr/uploads/2021/05/3758607470.png)\*\**\***
+
+***\**\*[18064-4a6tmoyfk3u.png](https://www.coder.rs/usr/uploads/2021/05/3758607470.png)\*\**\***
+
+
+
+***\**\*Student\*\**\***
+
+***\**\*"long\*\**\***
+
+***\**\*'short\*\**\***
+
+***\**\*People\*\**\***
+
+***\**\*那 `PhantomData` 是如何影响型变的呢？我们可以看下面这个例子。\*\**\***
+
+```
+struct MyCell<T> {
+    value: T,
+}
+
+impl<T: Copy> MyCell<T> {
+    fn new(value: T) -> Self {
+        MyCell { value }
+    }
+    fn get(&self) -> T {
+        self.value
+    }
+    fn set(&self, value: T) {
+        unsafe {
+            std::ptr::write( &self.value as *const _ as *mut _, value);
+        }
+    } 
+}
+
+fn main() {
+    let val = String::from("hello");
+    let cell = MyCell::new( &val );
+    println!("cell value={}", cell.get());
+}
+```
+
+***\**\*编译运行，输出 1024，看起来并没有任何问题。\*\**\***
+
+***\**\*但如果我们按下面的方式使用，代码还是可以正常编译，但是运行起来之后就发现结果是未定义的。\*\**\***
+
+```
+fn main() {
+    let val = String::from("hello");  // 'a: line2 ~ line9
+    let cell = MyCell::new( &val );   // 'b: line3 ~ line9
+    {
+        let val2 = String::from("hi"); // 'c: line5 ~ line7
+        cell.set( &val2 );   // 这里期待 cell 的类型是 MyCell<&'c String>
+    }
+    println!("cell value={}", cell.get());
+}
+
+//输出：cell value=�
+```
+
+***\**\*可以看到，上面代码中第五行有一个局部变量 `val`，第六行中把这个局部变量通过 `set` 函数设置到 `cell` 的 `value` 字段中了，当退出这个内部作用域之后，局部变量 `val` 就会被释放，而 `cell` 中仍然保持对已释放的局部变量的引用，从而导致了未定义错误。\*\**\***
+
+***\**\*看起来很明显的错误，为什么这里 Rust 语言的借用检查没有检测到呢？\*\**\***
+
+***\**\*原因就在于上面的 `MyCell` 类型是一个协变类型。上面代码中，`cell` 是通过传入 `&val` 构造的，它的引用的生命周期是 `'b` ，所以 `cell` 的类型实际是 `MyCell<&'b String>`。而接下来声明的内部块中，有一个局部变量 `val2`，它的生命周期是 `'c`，生命周期 `'b` 和生命周期 `'c` 的关系是：`'b: 'c`，也就是说 `'b` 是 `'c` 的子类型。而 `MyCell` 是一个协变类型，所以 `MyCell<&'b String>` 就是 `MyCell<&'c String>` 的子类型 ，这也是上面代码的第 16 行，明明需要的是一个 `MyCell<&'c String>` 的类型，但是传入 `MyCell<&'b String>` 也能检查通过。\*\**\***
+
+***\**\*所以解决方案就很简单了，去掉 `MyCell` 的协变性质，比入改成不变或逆变等即可。而 `PhantomData` 的一个重要作用就是影响 `T` 的型变。\*\**\***
+
+```
+use std::marker::PhantomData;
+struct MyCell<T> {
+    value: T,
+    _mark: PhantomData<*mut T>, // 对 T 上是不变
+}
+
+impl<T: Copy> MyCell<T> {
+    fn new(value: T) -> Self {
+        MyCell { value, _mark: PhantomData, }
+    }
+    // 其他不变....
+}
+
+fn main() {
+    let val = String::from("hello");   // 'a: line15 ~ line21
+    let cell = MyCell::new( &val );    // 'b: line16 ~ line21
+    {
+        let val2 = String::from("hi"); // 'c: line18 ~ line19
+        cell.set( &val2 );
+    }
+    println!("cell value={}", cell.get());
+}
+```
+
+***\**\*通过上面在 `MyCell` 中加入 `PhantomData<\*mut T>` 类型的字段后，`MyCell` 就成了\*\*不变\*\*。所以在上面代码中第 19 行，需要的是一个生命周期 `'b` 的参数，但传入的是一个生命周期 `'c` 的参数，并且具有 `'b: 'c` ，故借用检查不匹配，从而编译失败。\*\**\***
+
+***\**\*可见如果不了解协变和 `PhantomData` 的作用，在写 \*\*unsafe code\*\* 的时候还是会有可能产生未定义行为的风险。\*\**\***
+
+# ***\**\*Rust 不变、逆变与协变类型列表\*\**\***
+
+## ***\**\*普通类型\*\**\***
+
+| 类型      | 在 'a 上 | 在 T 上 |
+| :-------- | :------- | :------ |
+| T         |          | 协变    |
+| &'a T     | 协变     | 协变    |
+| &'a mut T | 协变     | 不变    |
+| *const T  |          | 协变    |
+| *mut T    |          | 不变    |
+
+## ***\**\*闭包类型\*\**\***
+
+| 类型     | 在 T 上 |
+| :------- | :------ |
+| FnT      | 逆变    |
+| Fn -> T  | 协变    |
+| FnT -> T | 不变    |
+
+## ***\**\*其他\*\**\***
+
+***\**\*`Box`、`Vec` 以及其他集合对于它们包含的类型来说都是协变。\*\**\***
+
+***\**\*`UnsafeCell` 、`Cell`、`RefCell`、`Mutex` 以及其他内部可变类型在 T 上都是不变。\*\**\***
+
+***\**\*\*\*对于结构体来说，如果包含的字段全部是协变，则结构体是协变，否则是不变\*\*。所以对于 `PhantomData` 来说，则有以下型变：\*\**\***
+
+| PhantomData 类型        | 在 'a 上 | 在 T 上 |
+| :---------------------- | :------- | :------ |
+| PhantomData<T>          |          | 协变    |
+| PhantomData<&'a T>      | 协变     | 协变    |
+| PhantomData<&'a mut T>  | 协变     | 不变    |
+| PhantomData<*const T>   |          | 协变    |
+| PhantomData<*mut T>     |          | 不变    |
+| PhantomData<fnT>        |          | 逆变    |
+| PhantomData<fn->T>      |          | 协变    |
+| PhantomData<fnT->T>     |          | 不变    |
+| PhantomData<Cell<&'a >> | 不变     |         |
+
